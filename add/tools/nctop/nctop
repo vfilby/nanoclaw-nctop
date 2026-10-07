@@ -1,0 +1,1888 @@
+#!/usr/bin/env python3
+# nctop: a read-only terminal dashboard for a NanoClaw v2 install.
+#
+#   tools/nctop/nctop                       the dashboard (press ? for keys)
+#   tools/nctop/nctop --dump VIEW [ARG]     print one view as text and exit (overview|sessions|tasks|logs|paths|
+#                                           files [dir]|file <path>|session <id> [--messages] [--verbose])
+#
+# Tabs: Overview (service, host, agents, running sessions, what needs attention, next tasks, containers), Sessions
+# (Enter follows one: the agent's own transcript with tool calls, or the inbound/outbound messages), Tasks, Logs (the
+# host log, followed), Files (the agent folders: CLAUDE.md, skills, memory, task logs).
+#
+# Read-only by construction: the central data comes from `ncl <resource> list --json`; the per-session mailboxes
+# (data/v2-sessions/<group>/<session>/{inbound,outbound}.db, which ncl has no resource for) are opened with mode=ro;
+# the only other commands are the service manager's status (systemctl --user show, or launchctl list) and docker
+# ps/stats. Nothing writes. Python 3 standard library only.
+#
+# Run it as the user the install belongs to (on a dedicated service account: sudo -u <account> tools/nctop/nctop):
+# transcripts are private to that user. NANOCLAW_DIR overrides the install root (default: two levels above this file).
+
+import curses
+import datetime as dt
+import glob
+import hashlib
+import json
+import os
+import re
+import shutil
+import socket
+import sqlite3
+import subprocess
+import sys
+import threading
+import time
+import unicodedata
+import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
+
+
+def install_root():
+    env = os.environ.get('NANOCLAW_DIR')
+    if env:
+        return os.path.abspath(env)
+    return os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+
+
+ROOT = install_root()
+DATA = os.path.join(ROOT, 'data')
+SESSIONS_DIR = os.path.join(DATA, 'v2-sessions')
+GROUPS_DIR = os.path.join(ROOT, 'groups')
+LOG_DIR = os.path.join(ROOT, 'logs')
+NCL = os.environ.get('NCTOP_NCL') or os.path.join(ROOT, 'bin', 'ncl')
+RUNTIME = os.environ.get('CONTAINER_RUNTIME') or 'docker'
+# The install slug (sha1 of the project root, as setup/lib/install-slug.sh) names the service and the containers.
+SLUG = hashlib.sha1(ROOT.encode()).hexdigest()[:8]
+SYSTEMD_UNIT = f'nanoclaw-v2-{SLUG}.service'
+LAUNCHD_LABEL = f'com.nanoclaw-v2-{SLUG}'
+CONTAINER_PREFIX = f'ncl-{SLUG}-'
+
+
+def container_name(session_id):
+    """A session's agent container, named as the docker driver's agentContainerName() does."""
+    raw = re.sub(r'[^a-zA-Z0-9_.-]', '-', f'{SLUG}-{session_id}')
+    if len(raw) <= 48:
+        return f'ncl-{raw}'
+    digest = hashlib.sha256(f'{SLUG}\0{session_id}'.encode()).hexdigest()[:8]
+    return f'ncl-{raw[:39]}-{digest}'
+
+# The file browser never lists or opens these, in any folder: an agent can write anything into its own folder.
+HIDDEN = re.compile(r'^\.(env|ssh|gnupg|netrc|aws|docker)\b|^id_|\.(pem|key|p12|pfx|kdbx)$|token|secret|credential|passw',
+                    re.I)
+MAX_FILE = 4 << 20        # bytes of one file shown
+MAX_TRANSCRIPT = 8 << 20  # bytes of a transcript read on open (its tail)
+MAX_LOG = 1 << 20         # bytes of a log read on open (its tail)
+MAX_LINES = 20000         # logical lines a followed pager keeps
+
+PROBLEMS = {}  # what failed last time (key -> message), shown on the overview
+
+
+def owner_hint():
+    """A problem line when this user is not the one the install belongs to (transcripts would be unreadable)."""
+    try:
+        owner = os.stat(DATA).st_uid
+    except OSError:
+        PROBLEMS['root'] = f'{ROOT} has no data/ directory: run nctop from a NanoClaw checkout or set NANOCLAW_DIR'
+        return
+    if owner != os.geteuid():
+        try:
+            import pwd
+            name = pwd.getpwuid(owner).pw_name
+        except (ImportError, KeyError):
+            name = str(owner)
+        PROBLEMS['owner'] = f'the install belongs to {name}; run as that user (sudo -u {name} {sys.argv[0]})'
+
+
+# ---- text ---------------------------------------------------------------------------------------------------------
+# A line is (segments, indent): segments are (text, style) pairs, indent is where wrapped continuations start.
+
+ANSI = re.compile(r'\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[@-Z\\-_]')
+CTRL = re.compile(r'[\x00-\x08\x0b-\x1f\x7f]')
+
+
+def clean(s):
+    return CTRL.sub('', ANSI.sub('', str(s)).replace('\t', '    ').replace('\r', ''))
+
+
+def cells(c):
+    if unicodedata.combining(c):
+        return 0
+    return 2 if unicodedata.east_asian_width(c) in 'WF' else 1
+
+
+def width(s):
+    return sum(cells(c) for c in s)
+
+
+def trunc(s, w):
+    if w <= 0:
+        return ''
+    s = clean(s).replace('\n', ' ')
+    if width(s) <= w:
+        return s
+    out, n = [], 0
+    for c in s:
+        k = cells(c)
+        if n + k > w - 1:
+            break
+        out.append(c)
+        n += k
+    return ''.join(out) + '…'
+
+
+def pad(s, w):
+    s = trunc(s, w)
+    return s + ' ' * (w - width(s))
+
+
+def L(*parts, indent=0):
+    return [p if isinstance(p, tuple) else (p, None) for p in parts], indent
+
+
+def text_lines(text, style=None, prefix=(), indent=None):
+    """Multi-line text: the prefix segments lead the first line, later lines line up under the text."""
+    prefix = [p if isinstance(p, tuple) else (p, None) for p in prefix]
+    ind = width(''.join(t for t, _ in prefix)) if indent is None else indent
+    out = []
+    for i, ln in enumerate(clean(text).split('\n')):
+        segs = list(prefix) if i == 0 else [(' ' * ind, None)]
+        segs.append((ln, style))
+        out.append((segs, ind))
+    return out
+
+
+def plain(segs):
+    return ''.join(t for t, _ in segs)
+
+
+def wrap(segs, w, indent=0):
+    if w <= 0:
+        return [[]]
+    indent = min(indent, w // 2)
+    rows, cur, n = [], [], 0
+    for text, style in segs:
+        buf = []
+        for c in text:
+            k = cells(c)
+            if n + k > w:
+                if buf:
+                    cur.append((''.join(buf), style))
+                    buf = []
+                rows.append(cur)
+                cur, n = ([(' ' * indent, None)], indent) if indent else ([], 0)
+            buf.append(c)
+            n += k
+        if buf:
+            cur.append((''.join(buf), style))
+    rows.append(cur)
+    return rows
+
+
+def first_lines(text, n):
+    lines = clean(text).strip('\n').split('\n')
+    return '\n'.join(lines[:n]), max(0, len(lines) - n)
+
+
+def last_lines(text, n):
+    lines = clean(text).strip('\n').split('\n')
+    return '\n'.join(lines[-n:]), max(0, len(lines) - n)
+
+
+def compact(obj, drop=('requestId',)):
+    if isinstance(obj, dict):
+        obj = {k: v for k, v in obj.items() if k not in drop}
+    return json.dumps(obj, ensure_ascii=False, separators=(',', ':'))
+
+
+def human_bytes(n):
+    try:
+        n = float(n)
+    except (TypeError, ValueError):
+        return '-'
+    for unit in ('B', 'K', 'M', 'G', 'T'):
+        if n < 1024 or unit == 'T':
+            return f'{n:.0f}{unit}' if unit == 'B' else f'{n:.1f}{unit}'
+        n /= 1024
+
+
+# ---- time ---------------------------------------------------------------------------------------------------------
+
+def parse_ts(s):
+    if not s:
+        return None
+    try:
+        t = dt.datetime.fromisoformat(str(s).replace('Z', '+00:00'))
+    except ValueError:
+        return None
+    return t if t.tzinfo else t.replace(tzinfo=dt.timezone.utc)
+
+
+def now_utc():
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def span(seconds):
+    s = int(abs(seconds))
+    if s < 60:
+        return f'{s}s'
+    if s < 3600:
+        return f'{s // 60}m'
+    if s < 86400:
+        return f'{s // 3600}h{(s % 3600) // 60:02d}m'
+    return f'{s // 86400}d{(s % 86400) // 3600}h'
+
+
+def ago(t):
+    if t is None:
+        return '-'
+    d = (now_utc() - t).total_seconds()
+    return f'in {span(d)}' if d < 0 else span(d)
+
+
+def local(t, fmt='%m-%d %H:%M'):
+    return t.astimezone().strftime(fmt) if t else '-'
+
+
+def fresh(t):
+    if t is None:
+        return 'dim'
+    d = (now_utc() - t).total_seconds()
+    return 'ok' if d < 900 else 'warn' if d < 7200 else 'dim'
+
+
+# ---- reading --------------------------------------------------------------------------------------------------------
+
+def query(path, sql, args=()):
+    """Rows from a session mailbox DB, read-only; [] when it is missing or busy (the next refresh tries again)."""
+    if not os.path.exists(path):
+        return []
+    try:
+        uri = 'file:' + urllib.parse.quote(path) + '?mode=ro'
+        with closing(sqlite3.connect(uri, uri=True, timeout=0.5)) as c:
+            c.row_factory = sqlite3.Row
+            return [dict(r) for r in c.execute(sql, args)]
+    except sqlite3.Error:
+        return []
+
+
+def run(argv, timeout=8, cwd=None):
+    key = ' '.join(os.path.basename(a) if i == 0 else a for i, a in enumerate(argv[:3]))
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, cwd=cwd, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError) as e:
+        PROBLEMS[key] = f'{key}: {e}'
+        return None
+    if p.returncode:
+        PROBLEMS[key] = f'{key}: exit {p.returncode} {clean(p.stderr).strip()[:200]}'
+        return None
+    PROBLEMS.pop(key, None)
+    return p.stdout
+
+
+def ncl(resource, *args, timeout=20):
+    """`ncl <resource> list --json`'s rows, or None when ncl failed (the reason goes to PROBLEMS)."""
+    key = f'ncl {resource} list'
+    out = run([NCL, resource, 'list', *args, '--json'], cwd=ROOT, timeout=timeout)
+    if out is None:
+        return None
+    try:
+        frame = json.loads(out[out.find('{'):])
+    except ValueError:
+        PROBLEMS[key] = f'{key}: not JSON'
+        return None
+    if not frame.get('ok'):
+        PROBLEMS[key] = f"{key}: {(frame.get('error') or {}).get('message', 'failed')}"
+        return None
+    return frame.get('data') or []
+
+
+def service_state():
+    if sys.platform == 'darwin':
+        d = {'unit': LAUNCHD_LABEL, 'missing': True}
+        for ln in (run(['launchctl', 'list']) or '').splitlines():
+            parts = ln.split('\t')
+            if len(parts) == 3 and parts[2] == LAUNCHD_LABEL:
+                running = parts[0] not in ('-', '')
+                d.update(missing=False, ActiveState='active' if running else 'inactive',
+                         SubState='running' if running else f'last exit {parts[1]}', MainPID=parts[0] if running else '')
+        return d
+    out = run(['systemctl', '--user', 'show', SYSTEMD_UNIT, '--timestamp=unix',
+               '-p', 'LoadState,ActiveState,SubState,ActiveEnterTimestamp,MainPID,NRestarts,MemoryCurrent'])
+    d = {'unit': SYSTEMD_UNIT}
+    for ln in (out or '').splitlines():
+        k, _, v = ln.partition('=')
+        d[k] = v
+    d['missing'] = out is None or d.get('LoadState') == 'not-found'
+    return d
+
+
+def json_lines(out):
+    rows = []
+    for ln in (out or '').splitlines():
+        try:
+            rows.append(json.loads(ln))
+        except ValueError:
+            pass
+    return rows
+
+
+def docker_ps():
+    out = run([RUNTIME, 'ps', '--format', '{{json .}}'])
+    return None if out is None else json_lines(out)
+
+
+def docker_stats():
+    out = run([RUNTIME, 'stats', '--no-stream', '--format', '{{json .}}'], timeout=20)
+    return {r.get('Name'): r for r in json_lines(out)}
+
+
+def host_stats():
+    d = {'name': socket.gethostname()}
+    try:
+        d['load'] = ['%.2f' % x for x in os.getloadavg()]
+    except OSError:
+        pass
+    try:
+        with open('/proc/uptime') as f:
+            d['uptime'] = float(f.read().split()[0])
+        mem = {}
+        with open('/proc/meminfo') as f:
+            for ln in f:
+                k, _, v = ln.partition(':')
+                mem[k] = int(v.split()[0]) * 1024
+        d['mem'] = (mem['MemTotal'] - mem.get('MemAvailable', 0), mem['MemTotal'])
+    except (OSError, KeyError, ValueError, IndexError):
+        pass  # not Linux
+    try:
+        u = shutil.disk_usage(ROOT)
+        d['disk'] = (u.used, u.total)
+    except OSError:
+        pass
+    return d
+
+
+class Host:
+    """What the views read. ncl and the service/container commands run in a background thread (in parallel: each
+    takes a few hundred ms); the views read the latest results. Session mailboxes are read on demand."""
+
+    FAST = {'groups': (), 'sessions': ('--limit', '5000'), 'messaging-groups': (), 'user-dms': (), 'users': (),
+            'approvals': ()}
+    SLOW = {'tasks': (), 'dropped-messages': ()}
+
+    def __init__(self):
+        self.data = {}
+        self.service = None
+        self.containers = None
+        self.stats = {}
+        self.refreshed = None
+        self._wake = threading.Event()
+
+    def refresh(self, slow=True):
+        jobs = dict(self.FAST, **(self.SLOW if slow else {}))
+        with ThreadPoolExecutor(max_workers=len(jobs) + 3) as pool:
+            rows = {r: pool.submit(ncl, r, *a) for r, a in jobs.items()}
+            service = pool.submit(service_state)
+            containers = pool.submit(docker_ps)
+            stats = pool.submit(docker_stats)
+            for r, f in rows.items():
+                self.data[r] = f.result()
+            self.service = service.result()
+            self.containers = containers.result()
+            self.stats = stats.result() if self.containers is not None else {}
+        self.refreshed = time.time()
+
+    def start(self):
+        def loop():
+            last_slow = 0
+            while True:
+                due = time.time() - last_slow > 30
+                try:
+                    self.refresh(slow=due)
+                except Exception as e:  # keep the loop alive; the overview shows it
+                    PROBLEMS['refresh'] = f'refresh: {e!r}'
+                if due:
+                    last_slow = time.time()
+                if self._wake.wait(5):
+                    self._wake.clear()
+                    last_slow = 0
+        threading.Thread(target=loop, daemon=True).start()
+
+    def poke(self):
+        self._wake.set()
+
+    def rows(self, resource):
+        return self.data.get(resource) or []
+
+    @property
+    def tasks(self):
+        return self.data.get('tasks')
+
+    def groups(self):
+        return {g['id']: g for g in sorted(self.rows('groups'), key=lambda g: g.get('name') or '')}
+
+    def messaging_groups(self):
+        return {m['id']: m for m in self.rows('messaging-groups')}
+
+    def dm_names(self):
+        names = {u['id']: u.get('display_name') for u in self.rows('users')}
+        return {d['messaging_group_id']: names[d['user_id']] for d in self.rows('user-dms') if names.get(d['user_id'])}
+
+    def sessions(self):
+        return sorted(self.rows('sessions'), key=lambda s: s.get('last_active') or '', reverse=True)
+
+    def approvals(self):
+        return sorted(self.rows('approvals'), key=lambda a: a.get('created_at') or '')
+
+    def dropped(self, hours=24):
+        cutoff = now_utc() - dt.timedelta(hours=hours)
+        return [d for d in self.rows('dropped-messages') if (parse_ts(d.get('last_seen')) or cutoff) > cutoff]
+
+
+# ---- sessions -------------------------------------------------------------------------------------------------------
+
+def sess_dir(s):
+    return os.path.join(SESSIONS_DIR, s['agent_group_id'], s['id'])
+
+
+def sess_db(s, name, sql, args=()):
+    return query(os.path.join(sess_dir(s), name), sql, args)
+
+
+def sess_state(s):
+    st = {r['key']: r['value'] for r in sess_db(s, 'outbound.db', 'select key, value from session_state')}
+    cs = sess_db(s, 'outbound.db', 'select current_tool, tool_started_at from container_state where id = 1')
+    if cs:
+        st.update(cs[0])
+    try:
+        st['heartbeat'] = dt.datetime.fromtimestamp(os.path.getmtime(os.path.join(sess_dir(s), '.heartbeat')),
+                                                    dt.timezone.utc)
+    except OSError:
+        pass
+    return st
+
+
+_transcripts = {}
+
+
+def transcript_path(s, st):
+    cid = st.get('continuation:claude')
+    if not cid:
+        return None
+    p = _transcripts.get(cid)
+    if p and os.path.exists(p):
+        return p
+    hits = glob.glob(os.path.join(glob.escape(os.path.join(SESSIONS_DIR, s['agent_group_id'])), '.claude-shared',
+                                  'projects', '*', glob.escape(cid) + '.jsonl'))
+    p = max(hits, key=os.path.getmtime) if hits else None
+    if p:
+        _transcripts[cid] = p
+    return p
+
+
+_titles = {}
+
+
+def transcript_title(path):
+    """The newest ai-title line in the transcript's tail (Claude Code rewrites it as the conversation moves on)."""
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return None
+    hit = _titles.get(path)
+    if hit and hit[0] == size:
+        return hit[1]
+    title = hit[1] if hit else None
+    with open(path, 'rb') as f:
+        f.seek(max(0, size - (256 << 10)))
+        tail = f.read()
+    for ln in reversed(tail.split(b'\n')):
+        if b'"ai-title"' in ln:
+            try:
+                title = json.loads(ln).get('aiTitle') or title
+                break
+            except ValueError:
+                continue
+    _titles[path] = (size, title)
+    return title
+
+
+_openers = {}
+
+
+def first_message(s):
+    if s['id'] in _openers:
+        return _openers[s['id']]
+    rows = sess_db(s, 'inbound.db', "select kind, content from messages_in where kind in ('chat-sdk', 'chat', 'task') "
+                                     "order by seq limit 1")
+    text = None
+    if rows:
+        c = loads(rows[0]['content'])
+        if isinstance(c, dict):
+            text = c.get('text') or c.get('prompt')
+        if text:  # its first line only: a pasted email or ticket can carry anything
+            text = trunc(text.strip().split('\n')[0], 200)
+            _openers[s['id']] = text
+    return text
+
+
+def where(s, mgs, dms):
+    mg = mgs.get(s.get('messaging_group_id') or '')
+    tid = s.get('thread_id') or ''
+    if not mg:
+        if tid.startswith('system:tasks:'):
+            return 'task ' + tid.split(':', 2)[2]
+        return 'internal'
+    name = mg.get('name')
+    if mg.get('is_group'):
+        label = '#' + (name or mg.get('platform_id') or '?')
+    elif mg.get('channel_type') == 'email' or (name and 'DM' in name):
+        label = name or mg.get('platform_id') or '?'
+    else:
+        label = 'DM ' + (dms.get(mg['id']) or name or mg.get('platform_id') or '?')
+    if mg.get('channel_type') not in ('slack', 'email'):
+        label = f"{mg.get('channel_type')}: {label}"
+    return label
+
+
+def thread_started(s):
+    m = re.search(r':(\d{9,}\.\d+)$', s.get('thread_id') or '')
+    if m:
+        return dt.datetime.fromtimestamp(float(m.group(1)), dt.timezone.utc)
+    return parse_ts(s.get('created_at'))
+
+
+def session_containers(containers):
+    """Running containers by name."""
+    return {c.get('Names', ''): c for c in containers or []}
+
+
+def session_rows(host, include_closed=False):
+    groups, mgs, dms = host.groups(), host.messaging_groups(), host.dm_names()
+    live = session_containers(host.containers)
+    rows = []
+    for s in host.sessions():
+        if s.get('status') != 'active' and not include_closed:
+            continue
+        st = sess_state(s)
+        tpath = transcript_path(s, st)
+        g = groups.get(s['agent_group_id'], {})
+        rows.append({
+            's': s, 'st': st, 'tpath': tpath,
+            'agent': g.get('name') or s['agent_group_id'], 'folder': g.get('folder'),
+            'where': where(s, mgs, dms), 'started': thread_started(s),
+            'last': parse_ts(s.get('last_active')), 'container': live.get(container_name(s['id'])),
+            'title': (transcript_title(tpath) if tpath else None) or first_message(s) or '',
+        })
+    return rows
+
+
+def container_cell(r):
+    """(text, style) for a session's container: what docker says, flagged when the DB disagrees."""
+    db = r['s'].get('container_status')
+    if r['container']:
+        return '● run', 'ok'
+    if db == 'running':
+        return '? run', 'warn'  # the DB thinks so, docker has no container
+    return '○', 'dim'
+
+
+def tool_cell(r):
+    st = r['st']
+    tool = st.get('current_tool')
+    if not tool:
+        return ''
+    t = parse_ts(st.get('tool_started_at'))
+    return f'{short_tool(tool)} {span((now_utc() - t).total_seconds())}' if t else short_tool(tool)
+
+
+def short_tool(name):
+    m = re.match(r'mcp__(.+?)__(.+)$', name or '')
+    if not m:
+        return name or ''
+    return m.group(2) if m.group(1) == 'nanoclaw' else f'{m.group(1)}:{m.group(2)}'
+
+
+# ---- rendering: messages ------------------------------------------------------------------------------------------
+
+def loads(s):
+    try:
+        return json.loads(s)
+    except (TypeError, ValueError):
+        return s
+
+
+def brief_result(c):
+    res = c.get('result')
+    if isinstance(res, dict):
+        for k in ('text', 'output', 'response', 'error'):
+            if isinstance(res.get(k), str) and res[k].strip():
+                return res[k]
+        return compact(res)
+    if c.get('error'):
+        return str(c['error'])
+    if c.get('frame') is not None:
+        return compact(c['frame'])
+    return compact(c)
+
+
+def brief_action(c, verbose):
+    a = c.get('action')
+    if a == 'send_email' and not verbose:
+        to = ', '.join(c.get('to') or [])
+        return f'to {to}: "{c.get("subject", "")}"'
+    if a in ('ops_run', 'ops_check'):
+        bits = [c.get('host'), c.get('tier'), c.get('check'), c.get('command') or c.get('query')]
+        return ' '.join(str(b) for b in bits if b) + (f'  ({c["reason"]})' if c.get('reason') and verbose else '')
+    return compact({k: v for k, v in c.items() if k != 'action'})
+
+
+def message_lines(direction, r, verbose=False):
+    t = parse_ts(r.get('timestamp'))
+    when = (local(t, '%m-%d %H:%M:%S') + ' ', 'dim')
+    c = loads(r.get('content'))
+    kind = r.get('kind')
+    if not isinstance(c, dict):
+        return text_lines(str(c), None, prefix=[when, (f'{direction} {kind}: ', 'dim')])
+    if direction == 'in':
+        status = r.get('status')
+        flag = [] if status in (None, 'completed') else [(f'[{status}] ', 'warn' if status == 'pending' else 'bad')]
+        if kind in ('chat-sdk', 'chat'):
+            who = c.get('senderName') or c.get('sender') or (c.get('author') or {}).get('fullName') or '?'
+            text = c.get('text') or ''
+            if c.get('attachments'):
+                text += f'  [{len(c["attachments"])} attachment(s)]'
+            return text_lines(text, None, prefix=[when, *flag, (f'» {who}: ', 'user')])
+        if kind == 'task':
+            return text_lines(c.get('prompt') or compact(c), 'warn', prefix=[when, *flag, ('⏰ task: ', 'warn')])
+        if kind == 'system':
+            label = c.get('type') or 'system'
+            body = brief_result(c)
+            if not verbose:
+                body, more = first_lines(body, 3)
+                body += f'\n… {more} more lines' if more else ''
+            style = 'bad' if c.get('status') not in (None, 'ok') else 'dim'
+            return text_lines(body, 'dim', prefix=[when, *flag, (f'  ⎿ {label} {c.get("status") or ""}: ', style)])
+        return text_lines(compact(c), 'dim', prefix=[when, *flag, (f'in {kind}: ', 'dim')])
+    # outbound
+    if kind == 'chat':
+        return text_lines(c.get('text') or compact(c), None, prefix=[when, ('● ', 'ok')])
+    if kind == 'task_log':
+        return text_lines(c.get('text') or compact(c), 'dim', prefix=[when, ('task log: ', 'dim')])
+    if kind == 'system':
+        if c.get('action') == 'set_status':
+            return text_lines(c.get('text') or '', 'dim', prefix=[when, ('  … ', 'dim')])
+        body = brief_action(c, verbose)
+        if not verbose:
+            body = trunc(body, 240)
+        return text_lines(body, None, prefix=[when, (f'⚙ {c.get("action") or "system"} ', 'tool')])
+    return text_lines(compact(c), 'dim', prefix=[when, (f'out {kind}: ', 'dim')])
+
+
+def session_messages(s, limit=500):
+    ins = sess_db(s, 'inbound.db', 'select seq, kind, timestamp, status, content from messages_in '
+                                   'order by seq desc limit ?', (limit,))
+    outs = sess_db(s, 'outbound.db', 'select seq, kind, timestamp, content from messages_out '
+                                     'order by seq desc limit ?', (limit,))
+    rows = [('in', r) for r in ins] + [('out', r) for r in outs]
+    rows.sort(key=lambda x: (x[1].get('timestamp') or '', x[0] == 'out'))
+    return rows
+
+
+# ---- rendering: transcripts ---------------------------------------------------------------------------------------
+
+def tool_summary(name, inp, verbose):
+    if not isinstance(inp, dict):
+        return str(inp)
+    if verbose:
+        return compact(inp, drop=())
+    for k in ('command', 'file_path', 'path', 'pattern', 'url', 'query', 'description', 'prompt', 'skill'):
+        v = inp.get(k)
+        if isinstance(v, str) and v:
+            extra = f'  ({inp["description"]})' if k == 'command' and inp.get('description') else ''
+            return trunc(v.split('\n')[0], 200) + extra
+    return trunc(compact(inp), 200)
+
+
+def result_text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        out = []
+        for x in content:
+            if isinstance(x, dict):
+                out.append(x.get('text') if x.get('type') == 'text' else f'[{x.get("type")}]')
+        return '\n'.join(o for o in out if o)
+    return compact(content)
+
+
+def transcript_lines(o, verbose=False):
+    """One transcript record as display lines (none for bookkeeping records unless verbose)."""
+    t = o.get('type')
+    when = (local(parse_ts(o.get('timestamp')), '%H:%M:%S') + ' ' if o.get('timestamp') else ' ' * 9, 'dim')
+    side = [('  ⤷ ', 'accent')] if o.get('isSidechain') else []
+    pre = [when, *side]
+    out = []
+    if t in ('user', 'assistant'):
+        content = (o.get('message') or {}).get('content')
+        items = [{'type': 'text', 'text': content}] if isinstance(content, str) else (content or [])
+        for x in items:
+            if not isinstance(x, dict):
+                continue
+            k = x.get('type')
+            if t == 'user' and k == 'text':
+                body, more = (x.get('text') or '', 0) if verbose else last_lines(x.get('text') or '', 8)
+                if more:
+                    out += [L(when, *side, (f'» … {more} earlier lines (v shows all)', 'dim'))]
+                out += text_lines(body, 'user', prefix=pre + [('» ', 'user')])
+            elif t == 'user' and k == 'tool_result':
+                body = result_text(x.get('content'))
+                body, more = first_lines(body, 40 if verbose else 2)
+                style = 'bad' if x.get('is_error') else 'dim'
+                out += text_lines(body + (f'\n… +{more} lines' if more else ''), style, prefix=pre + [('  ⎿ ', style)])
+            elif k == 'text':
+                out += text_lines(x.get('text') or '', None, prefix=pre + [('● ', 'ok')])
+            elif k == 'tool_use':
+                out += text_lines(tool_summary(x.get('name'), x.get('input'), verbose), None,
+                                  prefix=pre + [(f'⚙ {short_tool(x.get("name"))} ', 'tool')])
+            elif k == 'thinking':
+                if verbose and x.get('thinking'):
+                    out += text_lines(x['thinking'], 'dim', prefix=pre + [('∴ ', 'dim')])
+            elif k == 'image':
+                out += [L(*pre, ('[image]', 'dim'))]
+            elif verbose:
+                out += [L(*pre, (f'[{k}]', 'dim'))]
+        return out
+    if t == 'system':
+        sub = o.get('subtype')
+        if sub == 'compact_boundary':
+            return [L(*pre, ('──── conversation compacted ────', 'warn'))]
+        if o.get('level') == 'error' or 'error' in (sub or ''):
+            return text_lines(o.get('content') or sub or 'error', 'bad', prefix=pre + [('! ', 'bad')])
+        return [L(*pre, (f'[{sub}]', 'dim'))] if verbose else []
+    if t == 'attachment':
+        a = o.get('attachment') or {}
+        if a.get('type') == 'queued_command':
+            body, more = (a.get('prompt') or '', 0) if verbose else last_lines(str(a.get('prompt') or ''), 4)
+            return text_lines(body, 'user', prefix=pre + [('» (while busy) ', 'user')])
+        if a.get('type') == 'hook_success' and verbose:
+            return text_lines(first_lines(a.get('content') or '', 3)[0], 'dim',
+                              prefix=pre + [(f'[hook {a.get("hookName")}] ', 'dim')])
+        return [L(*pre, (f'[{a.get("type")}]', 'dim'))] if verbose else []
+    if t == 'ai-title':  # rewritten every turn; the sessions list shows the latest
+        return [L(*pre, ('title: ', 'dim'), (o.get('aiTitle') or '', 'accent'))] if verbose else []
+    return [L(*pre, (f'[{t}]', 'dim'))] if verbose else []
+
+
+class Tail:
+    """Reads a growing file incrementally; starts at its tail and notices truncation and rotation."""
+
+    def __init__(self, path, start_tail):
+        self.path, self.start_tail = path, start_tail
+        self.ino = self.pos = None
+        self.partial = b''
+
+    def read(self):
+        """New complete lines since the last call, and whether the file was replaced (the caller starts over)."""
+        try:
+            st = os.stat(self.path)
+        except OSError:
+            return [], False
+        reset = False
+        if self.ino != st.st_ino or st.st_size < (self.pos or 0):
+            reset = self.ino is not None
+            self.ino, self.pos, self.partial = st.st_ino, max(0, st.st_size - self.start_tail), b''
+            skip_first = self.pos > 0
+        else:
+            skip_first = False
+        if st.st_size == self.pos:
+            return [], reset
+        with open(self.path, 'rb') as f:
+            f.seek(self.pos)
+            chunk = f.read()
+        self.pos += len(chunk)
+        data = self.partial + chunk
+        lines = data.split(b'\n')
+        self.partial = lines.pop()
+        if skip_first and lines:
+            lines.pop(0)
+        return [ln.decode('utf-8', 'replace') for ln in lines], reset
+
+
+# ---- rendering: overview ------------------------------------------------------------------------------------------
+
+def overview_lines(host):
+    out = []
+    head = lambda s: out.append(L((s, 'head')))
+
+    sv = host.service
+    if sv is None:
+        out.append(L(('Service  ', 'bold'), ('checking…', 'dim')))
+    elif sv.get('missing'):
+        out.append(L(('Service  ', 'bold'), (f"no service {sv['unit']} for this checkout (has setup run?)", 'bad')))
+    else:
+        state = f"{sv.get('ActiveState', '?')} ({sv.get('SubState', '?')})"
+        segs = [('Service  ', 'bold'), (sv['unit'] + '  ', None),
+                (state, 'ok' if sv.get('ActiveState') == 'active' else 'bad')]
+        since = sv.get('ActiveEnterTimestamp', '')
+        if since.startswith('@'):
+            t = dt.datetime.fromtimestamp(int(since[1:]), dt.timezone.utc)
+            segs.append((f'  since {local(t)} ({ago(t)})', None))
+        if sv.get('MainPID') not in (None, '', '0'):
+            segs.append((f'  pid {sv["MainPID"]}', 'dim'))
+        if sv.get('MemoryCurrent', '').isdigit():
+            segs.append((f'  mem {human_bytes(sv["MemoryCurrent"])}', 'dim'))
+        if sv.get('NRestarts') not in (None, '', '0'):
+            segs.append((f'  restarts {sv["NRestarts"]}', 'warn'))
+        out.append(L(*segs))
+
+    hs = host_stats()
+    segs = [('Host     ', 'bold'), (hs['name'], None)]
+    if 'uptime' in hs:
+        segs.append((f'  up {span(hs["uptime"])}', None))
+    if 'load' in hs:
+        segs.append(('  load ' + ' '.join(hs['load']), 'warn' if float(hs['load'][0]) > (os.cpu_count() or 1) else None))
+    if 'mem' in hs:
+        used, total = hs['mem']
+        segs.append((f'  mem {human_bytes(used)}/{human_bytes(total)}', 'warn' if used > 0.9 * total else None))
+    if 'disk' in hs:
+        used, total = hs['disk']
+        segs.append((f'  disk {human_bytes(used)}/{human_bytes(total)}', 'bad' if used > 0.9 * total else None))
+    out.append(L(*segs))
+
+    others = [c for c in (host.containers or []) if not c.get('Names', '').startswith(CONTAINER_PREFIX)]
+    if others:
+        segs = [('Other    ', 'bold')]
+        for c in others:
+            status = c.get('Status', '')
+            style = 'bad' if 'unhealthy' in status or not status.startswith('Up') else \
+                'ok' if 'healthy' in status else None
+            segs += [(c.get('Names', '?'), style), ('  ', None)]
+        out.append(L(*segs))
+    elif host.containers is None and host.refreshed:
+        out.append(L(('Other    ', 'bold'), (f'{RUNTIME} ps failed (see Problems)', 'bad')))
+
+    rows = session_rows(host)
+    groups = host.groups()
+    out.append(L(''))
+    head('Agents')
+    for gid, g in groups.items():
+        mine = [r for r in rows if r['s']['agent_group_id'] == gid]
+        running = sum(1 for r in mine if r['container'])
+        last = max((r['last'] for r in mine if r['last']), default=None)
+        said = ''
+        for r in mine:
+            m = sess_db(r['s'], 'outbound.db', "select content from messages_out where kind = 'chat' "
+                                               'order by seq desc limit 1')
+            if m:
+                c = loads(m[0]['content'])
+                said = c.get('text', '') if isinstance(c, dict) else str(c)
+                break
+        out.append(L('  ', (pad(g['name'], 8), 'bold'), pad(g['folder'], 15),
+                     (pad(f'{running} running', 11), 'ok' if running else 'dim'),
+                     pad(f'{len(mine)} sessions', 13), ('last ', 'dim'), (pad(ago(last), 8), fresh(last)),
+                     (f'"{trunc(said, 120)}"' if said else '', 'dim')))
+
+    out.append(L(''))
+    live = [r for r in rows if r['container'] or r['st'].get('current_tool')]
+    head(f'Running sessions ({len(live)})')
+    if not live:
+        out.append(L(('  none', 'dim')))
+    for r in live:
+        stats = host.stats.get((r['container'] or {}).get('Names'), {})
+        out.append(L('  ', container_cell(r), ' ', (pad(r['agent'], 7), 'bold'), pad(r['where'], 22),
+                     (pad(tool_cell(r), 18), 'tool'), ('last ', 'dim'), (pad(ago(r['last']), 7), fresh(r['last'])),
+                     (pad(f"{stats.get('CPUPerc', '')} {stats.get('MemUsage', '').split(' /')[0]}", 18), 'dim'),
+                     (r['title'], 'accent')))
+
+    out.append(L(''))
+    head('Attention')
+    approvals, dropped = host.approvals(), host.dropped()
+    for a in approvals:
+        out.append(L('  ', ('approval ', 'warn'), f"{a.get('action')}: {a.get('title') or a.get('question') or ''}",
+                     (f"  {ago(parse_ts(a.get('created_at')))} ago", 'dim')))
+    for d in dropped[:8]:
+        out.append(L('  ', ('dropped ', 'warn'), f"{d.get('message_count')} from {d.get('sender_name') or d.get('user_id') or '?'}"
+                     f" on {d.get('platform_id')}: {d.get('reason')}", (f"  last {ago(parse_ts(d.get('last_seen')))} ago", 'dim')))
+    stuck = []
+    week = now_utc() - dt.timedelta(days=7)
+    for r in rows:
+        if (r['last'] or week) < week:
+            continue
+        for m in sess_db(r['s'], 'inbound.db', "select kind, status, tries, timestamp from messages_in "
+                                               "where status = 'failed' or tries > 2 order by seq desc limit 3"):
+            stuck.append((r, m))
+    for r, m in stuck[:8]:
+        out.append(L('  ', ('inbound ', 'bad'), f"{m['kind']} {m['status']} tries={m['tries']}  ",
+                     (f"{r['agent']} {r['where']}  {ago(parse_ts(m['timestamp']))} ago", 'dim')))
+    elog = os.path.join(LOG_DIR, 'nanoclaw.error.log')
+    try:
+        mt = dt.datetime.fromtimestamp(os.path.getmtime(elog), dt.timezone.utc)
+        with open(elog, 'rb') as f:
+            f.seek(max(0, os.path.getsize(elog) - 16384))
+            tail = [clean(x) for x in f.read().decode('utf-8', 'replace').splitlines() if x.strip()][-3:]
+        recent = (now_utc() - mt).total_seconds() < 3600
+        out.append(L('  ', ('error log ', 'bad' if recent else 'dim'), (f'written {ago(mt)} ago', 'bad' if recent else 'dim')))
+        for x in tail:
+            out.append(L('    ', (trunc(x, 400), 'dim')))
+    except OSError:
+        pass
+    if not (approvals or dropped or stuck):
+        out.append(L(('  no pending approvals, dropped messages (24h) or stuck inbound messages', 'dim')))
+
+    out.append(L(''))
+    tasks = host.tasks
+    head('Next tasks')
+    if tasks is None:
+        out.append(L(('  loading… (or ncl failed: see Problems)', 'dim')))
+    else:
+        upcoming = sorted((t for t in tasks if t.get('status') in ('pending', 'paused')),
+                          key=lambda t: t.get('next_run') or t.get('process_after') or '~')
+        for t in upcoming[:6]:
+            nxt = parse_ts(t.get('next_run') or t.get('process_after'))
+            out.append(L('  ', pad(ago(nxt), 10), (pad(groups.get(t.get('agent_group_id'), {}).get('name', '?'), 8), 'bold'),
+                         pad(t.get('series_id') or t.get('row_id') or '', 34), (pad(t.get('schedule') or 'once', 14), 'dim'),
+                         ('paused' if t.get('status') == 'paused' else '', 'warn'),
+                         (f"failed {t['failed_runs']}" if t.get('failed_runs') else '', 'bad')))
+        if not upcoming:
+            out.append(L(('  none scheduled', 'dim')))
+
+    if PROBLEMS:
+        out.append(L(''))
+        head('Problems')
+        for p in list(PROBLEMS.values())[:10]:
+            out.append(L('  ', (trunc(p, 300), 'bad')))
+    return out
+
+
+# ---- curses ---------------------------------------------------------------------------------------------------------
+
+STYLE = {}
+
+
+def init_styles():
+    try:
+        curses.start_color()
+        curses.use_default_colors()
+        bg = -1
+    except curses.error:
+        bg = curses.COLOR_BLACK
+    pairs = {'ok': curses.COLOR_GREEN, 'warn': curses.COLOR_YELLOW, 'bad': curses.COLOR_RED,
+             'accent': curses.COLOR_CYAN, 'tool': curses.COLOR_MAGENTA, 'user': curses.COLOR_CYAN,
+             'head': curses.COLOR_BLUE}
+    for i, (name, fg) in enumerate(pairs.items(), 1):
+        try:
+            curses.init_pair(i, fg, bg)
+            STYLE[name] = curses.color_pair(i)
+        except curses.error:
+            STYLE[name] = 0
+    STYLE['bad'] |= curses.A_BOLD
+    STYLE['user'] |= curses.A_BOLD
+    STYLE['head'] |= curses.A_BOLD
+    STYLE['dim'] = curses.A_DIM
+    STYLE['bold'] = curses.A_BOLD
+
+
+def put(win, y, x, text, attr=0, maxw=None):
+    h, w = win.getmaxyx()
+    if y < 0 or y >= h or x >= w:
+        return x
+    room = w - x if maxw is None else min(maxw, w - x)
+    text = trunc(text, room) if width(text) > room else text
+    try:
+        win.addstr(y, x, text, attr)
+    except curses.error:
+        pass  # the bottom-right cell
+    return x + width(text)
+
+
+def put_segs(win, y, x, segs, maxw, extra=0):
+    end = x + maxw
+    for text, style in segs:
+        if x >= end:
+            break
+        x = put(win, y, x, text, STYLE.get(style, 0) | extra, end - x)
+    return x
+
+
+class Pager:
+    """Scrollable wrapped lines. A followed pager sticks to the bottom until scrolled up, like less +F."""
+
+    def __init__(self, follow=False, followable=False):
+        self.lines = []
+        self.top = 0
+        self.follow = follow
+        self.followable = followable or follow
+        self.search = None
+        self.h = 1
+        self._w = None
+        self._wrapped = []
+        self._n = 0
+
+    def set(self, lines):
+        self.lines = lines
+        self._w = None
+
+    def append(self, lines):
+        self.lines.extend(lines)
+        if len(self.lines) > MAX_LINES:
+            del self.lines[:len(self.lines) - MAX_LINES]
+            self._w = None
+
+    def wrapped(self, w):
+        if w != self._w or self._n > len(self.lines):
+            self._w, self._wrapped, self._n = w, [], 0
+        for segs, ind in self.lines[self._n:]:
+            self._wrapped.extend(wrap(segs, w, ind))
+        self._n = len(self.lines)
+        return self._wrapped
+
+    def draw(self, win, y, h, w):
+        self.h = h
+        rows = self.wrapped(w)
+        bottom = max(0, len(rows) - h)
+        if self.follow:
+            self.top = bottom
+        self.top = min(max(0, self.top), bottom)
+        if self.followable and self.top >= bottom and not self.follow and self._scrolled_down:
+            self.follow = True
+        self._scrolled_down = False
+        needle = (self.search or '').lower()
+        for i in range(min(h, len(rows) - self.top)):
+            segs = rows[self.top + i]
+            hit = curses.A_REVERSE if needle and needle in plain(segs).lower() else 0
+            put_segs(win, y + i, 0, segs, w, hit)
+
+    _scrolled_down = False
+
+    def scroll(self, n):
+        self.top += n
+        if n < 0:
+            self.follow = False
+        else:
+            self._scrolled_down = True
+
+    def find(self, term, backwards=False):
+        self.search = term or self.search
+        if not self.search or self._w is None:
+            return False
+        rows, needle = self._wrapped, self.search.lower()
+        order = range(self.top - 1, -1, -1) if backwards else range(self.top + 1, len(rows))
+        for i in order:
+            if needle in plain(rows[i]).lower():
+                self.top, self.follow = i, False
+                return True
+        return False
+
+    def key(self, k):
+        h = max(1, self.h - 1)
+        if k in (curses.KEY_DOWN, ord('j')):
+            self.scroll(1)
+        elif k in (curses.KEY_UP, ord('k')):
+            self.scroll(-1)
+        elif k in (curses.KEY_NPAGE, ord(' '), 6):
+            self.scroll(h)
+        elif k in (curses.KEY_PPAGE, ord('b'), 2):
+            self.scroll(-h)
+        elif k in (curses.KEY_HOME, ord('g')):
+            self.top, self.follow = 0, False
+        elif k in (curses.KEY_END, ord('G')):
+            self.top = 1 << 30
+            self.follow = self.followable
+        elif k == ord('f') and self.followable:
+            self.follow = not self.follow
+        elif k == ord('n'):
+            self.find(None)
+        elif k == ord('N'):
+            self.find(None, backwards=True)
+        else:
+            return False
+        return True
+
+
+class Table:
+    """Rows of cells with a moving selection that survives refreshes (rows are matched by key)."""
+
+    def __init__(self, columns):
+        self.columns = columns  # [(title, width)], width None = the rest
+        self.rows = []          # [(key, [(text, style)], obj)]
+        self.sel = 0
+        self.top = 0
+        self.h = 1
+
+    def set(self, rows):
+        key = self.rows[self.sel][0] if self.rows and self.sel < len(self.rows) else None
+        self.rows = rows
+        for i, r in enumerate(rows):
+            if r[0] == key:
+                self.sel = i
+                break
+        self.sel = min(self.sel, max(0, len(rows) - 1))
+
+    def selected(self):
+        return self.rows[self.sel][2] if self.rows else None
+
+    def widths(self, w):
+        fixed = sum(cw + 1 for _, cw in self.columns if cw)
+        return [cw if cw else max(4, w - fixed) for _, cw in self.columns]
+
+    def draw(self, win, y, h, w):
+        ws = self.widths(w)
+        x = 0
+        for (title, _), cw in zip(self.columns, ws):
+            put(win, y, x, pad(title, cw), STYLE['bold'] | curses.A_UNDERLINE)
+            x += cw + 1
+        h -= 1
+        self.h = h
+        if self.sel < self.top:
+            self.top = self.sel
+        if self.sel >= self.top + h:
+            self.top = self.sel - h + 1
+        for i in range(min(h, len(self.rows) - self.top)):
+            j = self.top + i
+            _, cells_, _ = self.rows[j]
+            rev = curses.A_REVERSE if j == self.sel else 0
+            if rev:
+                put(win, y + 1 + i, 0, ' ' * w, rev)
+            x = 0
+            for (text, style), cw in zip(cells_, ws):
+                put(win, y + 1 + i, x, pad(text, cw), STYLE.get(style, 0) | rev)
+                x += cw + 1
+        if not self.rows:
+            put(win, y + 1, 0, '(nothing)', STYLE['dim'])
+
+    def key(self, k):
+        n = len(self.rows)
+        if k in (curses.KEY_DOWN, ord('j')):
+            self.sel = min(n - 1, self.sel + 1)
+        elif k in (curses.KEY_UP, ord('k')):
+            self.sel = max(0, self.sel - 1)
+        elif k in (curses.KEY_NPAGE, ord(' '), 6):
+            self.sel = min(n - 1, self.sel + max(1, self.h - 1))
+        elif k in (curses.KEY_PPAGE, ord('b'), 2):
+            self.sel = max(0, self.sel - max(1, self.h - 1))
+        elif k in (curses.KEY_HOME, ord('g')):
+            self.sel = 0
+        elif k in (curses.KEY_END, ord('G')):
+            self.sel = max(0, n - 1)
+        else:
+            return False
+        self.sel = max(0, self.sel)
+        return True
+
+
+ENTER = (10, 13, curses.KEY_ENTER)
+BACK = (curses.KEY_BACKSPACE, 127, 8, curses.KEY_LEFT, ord('h'))
+
+
+class View:
+    title = ''
+    keys = ''
+    every = 2.0  # seconds between refreshes
+
+    def __init__(self, host):
+        self.host = host
+        self.next = 0
+
+    def tick(self):
+        if time.time() >= self.next:
+            self.next = time.time() + self.every
+            self.refresh()
+
+    def refresh(self):
+        pass
+
+    def header(self):
+        return []
+
+    def body(self):
+        raise NotImplementedError
+
+    def draw(self, win, y, h, w):
+        head = self.header()
+        for i, line in enumerate(head[:max(0, h - 2)]):
+            put_segs(win, y + i, 0, line[0], w)
+        n = min(len(head), max(0, h - 2))
+        self.body().draw(win, y + n, h - n, w)
+
+    def key(self, k):
+        return self.body().key(k)
+
+    def search(self, term):
+        b = self.body()
+        if isinstance(b, Pager):
+            b.find(term)
+
+
+class OverviewView(View):
+    title, keys, every = 'Overview', 'j/k scroll  r refresh', 3.0
+
+    def __init__(self, host):
+        super().__init__(host)
+        self.pager = Pager()
+
+    def refresh(self):
+        self.pager.set(overview_lines(self.host))
+
+    def body(self):
+        return self.pager
+
+
+class SessionsView(View):
+    title, keys, every = 'Sessions', 'Enter follow  c closed too  r refresh', 2.0
+
+    def __init__(self, host):
+        super().__init__(host)
+        self.closed = False
+        self.table = Table([('', 5), ('agent', 7), ('where', 22), ('started', 11), ('tool', 16), ('last', 7),
+                            ('about', None)])
+
+    def refresh(self):
+        rows = []
+        for r in session_rows(self.host, self.closed):
+            closed = r['s'].get('status') != 'active'
+            rows.append((r['s']['id'], [container_cell(r), (r['agent'], 'bold'), (r['where'], 'dim' if closed else None),
+                                        (local(r['started']), 'dim'), (tool_cell(r), 'tool'),
+                                        (ago(r['last']), fresh(r['last'])), (r['title'], 'accent')], r))
+        self.table.set(rows)
+
+    def header(self):
+        n = len(self.table.rows)
+        live = sum(1 for _, _, r in self.table.rows if r['container'])
+        return [L((f'{n} {"" if self.closed else "active "}sessions, {live} with a container', 'dim'))]
+
+    def body(self):
+        return self.table
+
+    def key(self, k):
+        if k in ENTER and self.table.selected():
+            return ('push', SessionView(self.host, self.table.selected()['s']))
+        if k == ord('c'):
+            self.closed = not self.closed
+            self.next = 0
+            return True
+        return self.table.key(k)
+
+
+class SessionView(View):
+    keys = 't transcript  m messages  v verbose  f follow  / search  o agent folder  O session folder'
+    every = 1.0
+
+    def __init__(self, host, s, mode=None):
+        super().__init__(host)
+        self.s = s
+        self.verbose = False
+        self.st = sess_state(s)
+        self.mode = mode or ('transcript' if transcript_path(s, self.st) else 'messages')
+        self.reset()
+
+    @property
+    def title(self):
+        return 'Session'
+
+    def reset(self):
+        self.pager = Pager(follow=True)
+        self.tail = None
+        self.tpath = None
+        self.seen = None
+
+    def refresh(self):
+        fresh_rows = [r for r in self.host.sessions() if r['id'] == self.s['id']]
+        if fresh_rows:
+            self.s = fresh_rows[0]
+        self.st = sess_state(self.s)
+        if self.mode == 'transcript':
+            path = transcript_path(self.s, self.st)
+            if path != self.tpath:  # first open, or the agent started a new Claude session (/clear, compaction)
+                if self.tpath:
+                    self.pager.append([L(('──── new transcript ────', 'warn'))])
+                self.tpath, self.tail = path, Tail(path, MAX_TRANSCRIPT) if path else None
+            if not self.tail:
+                if not self.pager.lines:
+                    self.pager.set([L(('no Claude transcript for this session (m shows its messages)', 'dim'))])
+                return
+            lines, replaced = self.tail.read()
+            if replaced:
+                self.pager.set([])
+            new = []
+            for ln in lines:
+                try:
+                    o = json.loads(ln)
+                except ValueError:
+                    continue
+                new += transcript_lines(o, self.verbose)
+            self.pager.append(new)
+        else:
+            rows = session_messages(self.s)
+            sig = (len(rows), rows[-1][1].get('timestamp') if rows else None, self.verbose)
+            if sig != self.seen:
+                self.seen = sig
+                lines = []
+                for direction, r in rows:
+                    lines += message_lines(direction, r, self.verbose)
+                self.pager.set(lines or [L(('no messages', 'dim'))])
+
+    def header(self):
+        groups = self.host.groups()
+        g = groups.get(self.s['agent_group_id'], {})
+        mgs, dms = self.host.messaging_groups(), self.host.dm_names()
+        live = session_containers(self.host.containers).get(container_name(self.s['id']))
+        r = {'s': self.s, 'st': self.st, 'container': live}
+        last = parse_ts(self.s.get('last_active'))
+        tool = tool_cell(r)
+        mode = [(f' {m} ', 'bold' if m == self.mode else 'dim') for m in ('transcript', 'messages')]
+        return [
+            L((g.get('name') or '?', 'bold'), '  ', where(self.s, mgs, dms), '  ', (self.s['id'], 'dim'),
+              '  ', container_cell(r), '  ', ('last ', 'dim'), (ago(last), fresh(last)),
+              *(('  ', None), (tool, 'tool')) if tool else ()),
+            L(*mode, ('  verbose' if self.verbose else '', 'warn'),
+              ('  following' if self.pager.follow else '  paused (G or f to follow)', 'ok' if self.pager.follow else 'warn'),
+              (f'  {os.path.basename(self.tpath)}' if self.mode == 'transcript' and self.tpath else '', 'dim')),
+        ]
+
+    def body(self):
+        return self.pager
+
+    def key(self, k):
+        if k in (ord('t'), ord('m')):
+            mode = 'transcript' if k == ord('t') else 'messages'
+            if mode != self.mode:
+                self.mode = mode
+                self.reset()
+                self.next = 0
+            return True
+        if k == ord('v'):
+            self.verbose = not self.verbose
+            self.reset()
+            self.next = 0
+            return True
+        if k == ord('o'):
+            g = self.host.groups().get(self.s['agent_group_id'], {})
+            if g.get('folder'):
+                return ('push', FilesView(self.host, os.path.join(GROUPS_DIR, g['folder'])))
+        if k == ord('O'):
+            return ('push', FilesView(self.host, sess_dir(self.s)))
+        return self.pager.key(k)
+
+
+class TasksView(View):
+    title, keys, every = 'Tasks', 'Enter details  a all/pending  r refresh', 2.0
+
+    def __init__(self, host):
+        super().__init__(host)
+        self.all = False
+        self.table = Table([('next', 10), ('agent', 7), ('task', 34), ('schedule', 14), ('runs', 7), ('last', 8),
+                            ('status', 9), ('prompt', None)])
+
+    def refresh(self):
+        groups = self.host.groups()
+        rows = []
+        for t in sorted(self.host.tasks or [], key=lambda t: t.get('next_run') or t.get('process_after') or '~'):
+            if not self.all and t.get('status') not in ('pending', 'paused'):
+                continue
+            nxt = parse_ts(t.get('next_run') or t.get('process_after'))
+            last = parse_ts(t.get('last_run'))
+            runs = f"{t.get('runs', 0)}" + (f"/{t['failed_runs']}!" if t.get('failed_runs') else '')
+            rows.append((t.get('row_id') or t.get('series_id'), [
+                (ago(nxt), None), (groups.get(t.get('agent_group_id'), {}).get('name', '?'), 'bold'),
+                (t.get('series_id') or t.get('row_id') or '', None), (t.get('schedule') or 'once', 'dim'),
+                (runs, 'bad' if t.get('failed_runs') else None), (ago(last) if last else '-', 'dim'),
+                (t.get('status') or '', 'warn' if t.get('status') == 'paused' else None),
+                ((t.get('prompt') or '').split('\n')[0], 'dim')], t))
+        self.table.set(rows)
+
+    def header(self):
+        if self.host.tasks is None:
+            return [L(('loading tasks from ncl… (r retries; failures show on the overview)', 'dim'))]
+        return [L((f'{len(self.table.rows)} {"" if self.all else "pending/paused "}tasks', 'dim'))]
+
+    def body(self):
+        return self.table
+
+    def key(self, k):
+        if k in ENTER and self.table.selected():
+            return ('push', TaskView(self.host, self.table.selected()))
+        if k == ord('a'):
+            self.all = not self.all
+            self.next = 0
+            return True
+        return self.table.key(k)
+
+
+class TaskView(View):
+    title, keys, every = 'Task', 's follow its session  / search', 5.0
+
+    def __init__(self, host, t):
+        super().__init__(host)
+        self.t = t
+        self.pager = Pager()
+
+    def refresh(self):
+        lines = [L((f'{k:18}', 'dim'), str(v)) for k, v in self.t.items() if k not in ('prompt',)]
+        lines.append(L(''))
+        lines.append(L(('prompt', 'head')))
+        lines += text_lines(self.t.get('prompt') or '')
+        g = self.host.groups().get(self.t.get('agent_group_id'), {})
+        log = self.t.get('log')
+        if log and g.get('folder'):
+            path = os.path.join(GROUPS_DIR, g['folder'], log)
+            lines += [L(''), L((f'log  {os.path.relpath(path, ROOT)}', 'head'))]
+            lines += file_lines(path)
+        self.pager.set(lines)
+
+    def body(self):
+        return self.pager
+
+    def key(self, k):
+        if k == ord('s'):
+            for s in self.host.sessions():
+                if s['id'] == self.t.get('session_id'):
+                    return ('push', SessionView(self.host, s))
+        return self.pager.key(k)
+
+
+class LogsView(View):
+    title, keys, every = 'Logs', 'e error log  w warnings only  f follow  / search', 1.0
+    LEVEL = re.compile(r'\b(TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL)\b')
+
+    def __init__(self, host):
+        super().__init__(host)
+        self.which = 'nanoclaw.log'
+        self.warn_only = False
+        self.reset()
+
+    def reset(self):
+        self.pager = Pager(follow=True)
+        self.tail = Tail(os.path.join(LOG_DIR, self.which), MAX_LOG)
+
+    def refresh(self):
+        lines, replaced = self.tail.read()
+        if replaced:
+            self.pager.append([L(('──── log rotated ────', 'warn'))])
+        new = []
+        for ln in lines:
+            ln = clean(ln)
+            m = self.LEVEL.search(ln[:40])
+            lvl = m.group(1) if m else ''
+            if self.warn_only and lvl not in ('WARN', 'WARNING', 'ERROR', 'FATAL'):
+                continue
+            style = {'ERROR': 'bad', 'FATAL': 'bad', 'WARN': 'warn', 'WARNING': 'warn', 'DEBUG': 'dim',
+                     'TRACE': 'dim'}.get(lvl)
+            new.append(L((ln, style), indent=15))
+        self.pager.append(new)
+
+    def header(self):
+        return [L((self.which, 'bold'), ('  warnings and errors only' if self.warn_only else '', 'warn'),
+                  ('  following' if self.pager.follow else '  paused (G or f to follow)',
+                   'ok' if self.pager.follow else 'warn'))]
+
+    def body(self):
+        return self.pager
+
+    def key(self, k):
+        if k == ord('e'):
+            self.which = 'nanoclaw.error.log' if self.which == 'nanoclaw.log' else 'nanoclaw.log'
+        elif k == ord('w'):
+            self.warn_only = not self.warn_only
+        else:
+            return self.pager.key(k)
+        self.reset()
+        self.next = 0
+        return True
+
+
+def list_dir(path, by_time=False):
+    try:
+        names = os.listdir(path)
+    except OSError as e:
+        return None, str(e)
+    entries = []
+    for n in names:
+        if HIDDEN.search(n):
+            continue
+        p = os.path.join(path, n)
+        try:
+            st = os.lstat(p)
+        except OSError:
+            continue
+        isdir = os.path.isdir(p)
+        entries.append({'name': n, 'path': p, 'dir': isdir, 'size': st.st_size,
+                        'mtime': dt.datetime.fromtimestamp(st.st_mtime, dt.timezone.utc),
+                        'link': os.path.islink(p)})
+    if by_time:
+        entries.sort(key=lambda e: e['mtime'], reverse=True)
+    else:
+        entries.sort(key=lambda e: (not e['dir'], e['name'].lower()))
+    return entries, None
+
+
+def file_lines(path):
+    if HIDDEN.search(os.path.basename(path)):
+        return [L(('hidden (looks like a secret)', 'warn'))]
+    try:
+        size = os.path.getsize(path)
+        with open(path, 'rb') as f:
+            data = f.read(MAX_FILE)
+    except OSError as e:
+        return [L((str(e), 'bad'))]
+    if data.startswith(b'SQLite format 3'):
+        rows = query(path, "select name from sqlite_master where type = 'table' order by name")
+        return [L((f'SQLite database, {human_bytes(size)}; tables:', 'dim'))] + [L('  ' + r['name']) for r in rows]
+    if b'\0' in data[:8192]:
+        return [L((f'binary file, {human_bytes(size)}', 'dim'))]
+    text = data.decode('utf-8', 'replace')
+    if path.endswith('.json'):
+        try:
+            text = json.dumps(json.loads(text), indent=2, ensure_ascii=False)
+        except ValueError:
+            pass
+    lines = text_lines(text)
+    if size > MAX_FILE:
+        lines.append(L((f'… truncated at {human_bytes(MAX_FILE)} of {human_bytes(size)}', 'warn')))
+    return lines
+
+
+class FilesView(View):
+    keys = 'Enter open  ← up  s sort name/time'
+    every = 3.0
+
+    def __init__(self, host, root=GROUPS_DIR):
+        super().__init__(host)
+        self.root = os.path.realpath(root)
+        self.cwd = self.root
+        self.by_time = False
+        self.error = None
+        self.table = Table([('name', None), ('size', 8), ('modified', 12)])
+
+    @property
+    def title(self):
+        return 'Files'
+
+    def refresh(self):
+        entries, self.error = list_dir(self.cwd, self.by_time)
+        rows = []
+        for e in entries or []:
+            name = e['name'] + ('/' if e['dir'] else '') + (' @' if e['link'] else '')
+            rows.append((e['path'], [(name, 'accent' if e['dir'] else None),
+                                     ('' if e['dir'] else human_bytes(e['size']), 'dim'),
+                                     (local(e['mtime']), fresh(e['mtime']))], e))
+        self.table.set(rows)
+
+    def header(self):
+        rel = os.path.relpath(self.cwd, ROOT) if self.cwd.startswith(ROOT) else self.cwd
+        return [L((rel + '/', 'bold'), (f'  sorted by {"time" if self.by_time else "name"}', 'dim'),
+                  (f'  {self.error}' if self.error else '', 'bad'))]
+
+    def body(self):
+        return self.table
+
+    def go(self, path):
+        real = os.path.realpath(path)
+        if real == self.root or real.startswith(self.root + os.sep):  # never climb out of the root, even by symlink
+            self.cwd = real
+            self.table.sel = self.table.top = 0
+            self.next = 0
+            return True
+        return False
+
+    def key(self, k):
+        e = self.table.selected()
+        if k in ENTER + (curses.KEY_RIGHT, ord('l')) and e:
+            if e['dir']:
+                self.go(e['path'])
+                return True
+            real = os.path.realpath(e['path'])
+            if real.startswith(self.root + os.sep):
+                return ('push', FileView(self.host, real))
+            return True
+        if k in BACK:
+            if self.cwd != self.root:
+                prev = self.cwd
+                self.go(os.path.dirname(self.cwd))
+                self.refresh()
+                for i, r in enumerate(self.table.rows):
+                    if os.path.realpath(r[0]) == prev:
+                        self.table.sel = i
+                return True
+            return False
+        if k == ord('s'):
+            self.by_time = not self.by_time
+            self.next = 0
+            return True
+        return self.table.key(k)
+
+
+class FileView(View):
+    title, keys, every = 'File', '/ search  n/N next/prev  (reloads when the file changes)', 2.0
+
+    def __init__(self, host, path):
+        super().__init__(host)
+        self.path = path
+        self.pager = Pager()
+        self.mtime = None
+
+    def refresh(self):
+        try:
+            mt = os.path.getmtime(self.path)
+        except OSError:
+            mt = None
+        if mt != self.mtime:
+            self.mtime = mt
+            self.pager.set(file_lines(self.path))
+
+    def header(self):
+        mt = dt.datetime.fromtimestamp(self.mtime, dt.timezone.utc) if self.mtime else None
+        return [L((os.path.relpath(self.path, ROOT), 'bold'), (f'  modified {local(mt)} ({ago(mt)} ago)', 'dim'))]
+
+    def body(self):
+        return self.pager
+
+
+HELP = """nctop: read-only dashboard for NanoClaw v2
+
+Anywhere
+  1-5 / Tab / Shift-Tab   switch tab: Overview, Sessions, Tasks, Logs, Files
+  q / Esc                 back; quit from a tab
+  Q                       quit
+  r                       refresh now (also re-runs systemctl, docker and ncl)
+  ?                       this help
+
+Lists                     j/k or arrows move, Space/b page, g/G top/bottom, Enter opens
+Text                      j/k scroll, Space/b page, g/G top/bottom (G also resumes following),
+                          f follow on/off, / search, n/N next/previous match
+
+Sessions                  c includes closed sessions
+Session                   t the agent's transcript (its Claude Code session: text, tool calls, results)
+                          m the session's messages (what came in and what went out, host-side)
+                          v verbose: whole messages, thinking, hooks, bookkeeping records
+                          o browse the agent's folder, O browse the session folder (inbox, outbox)
+Tasks                     a includes finished and cancelled tasks; Enter shows details and the run log;
+                          s (in a task) follows its session
+Logs                      e switches to the error log, w shows warnings and errors only
+Files                     Enter/→ opens, ←/Backspace goes up, s sorts by name or by time (newest first)
+
+Columns: ● run = a live container, ? run = the database says running but docker has none, ○ = stopped.
+'last' is green under 15 minutes, yellow under 2 hours.
+
+Nothing here changes anything: it reads through `ncl <resource> list --json`, opens the session
+mailboxes read-only, and otherwise runs only the service manager's status and docker ps/stats.
+"""
+
+
+class HelpView(View):
+    title, keys = 'Help', 'q back'
+
+    def __init__(self, host):
+        super().__init__(host)
+        self.pager = Pager()
+        self.pager.set(text_lines(HELP))
+
+    def body(self):
+        return self.pager
+
+
+class App:
+    def __init__(self, scr, host):
+        self.scr, self.host = scr, host
+        self.tabs = [OverviewView(host), SessionsView(host), TasksView(host), LogsView(host), FilesView(host)]
+        self.tab = 0
+        self.stack = []
+        self.message = None
+
+    def view(self):
+        return self.stack[-1] if self.stack else self.tabs[self.tab]
+
+    def draw(self):
+        scr = self.scr
+        scr.erase()
+        h, w = scr.getmaxyx()
+        if h < 6 or w < 30:
+            put(scr, 0, 0, 'terminal too small')
+            scr.refresh()
+            return
+        x = put(scr, 0, 0, ' nctop ', STYLE['bold'] | curses.A_REVERSE)
+        for i, t in enumerate(self.tabs):
+            attr = curses.A_REVERSE | STYLE['bold'] if i == self.tab and not self.stack else 0
+            x = put(scr, 0, x + 1, f' {i + 1} {t.title} ', attr)
+        for v in self.stack:
+            x = put(scr, 0, x + 1, f'› {v.title}', STYLE['bold'] | (curses.A_REVERSE if v is self.stack[-1] else 0))
+        sv = self.host.service or {}
+        state = sv.get('ActiveState') or '…'
+        right = f' {socket.gethostname()}  {state} '
+        put(scr, 0, max(x + 2, w - width(right) - 1), right,
+            STYLE['ok'] if state == 'active' else STYLE['bad'] if sv else STYLE['dim'])
+        v = self.view()
+        v.draw(scr, 1, h - 2, w)
+        foot = self.message or f' {v.keys}  ? help  q {"back" if self.stack else "quit"}'
+        put(scr, h - 1, 0, pad(foot, w - 1), STYLE['dim'] | curses.A_REVERSE)
+        if self.host.refreshed and not self.message:
+            stamp = time.strftime(' %H:%M:%S ', time.localtime(self.host.refreshed))
+            put(scr, h - 1, w - len(stamp) - 1, stamp, curses.A_REVERSE)
+        scr.refresh()
+
+    def prompt(self, label):
+        h, w = self.scr.getmaxyx()
+        buf = ''
+        self.scr.timeout(-1)
+        curses.curs_set(1)
+        try:
+            while True:
+                put(self.scr, h - 1, 0, pad(label + buf, w - 1), curses.A_REVERSE)
+                self.scr.move(h - 1, min(w - 2, width(label + buf)))
+                k = self.scr.get_wch()
+                if k in ('\n', '\r') or k == curses.KEY_ENTER:
+                    return buf
+                if k == '\x1b':
+                    return None
+                if k in ('\x7f', '\b') or k == curses.KEY_BACKSPACE:
+                    buf = buf[:-1]
+                elif isinstance(k, str) and k.isprintable():
+                    buf += k
+        finally:
+            try:
+                curses.curs_set(0)
+            except curses.error:
+                pass
+            self.scr.timeout(500)
+
+    def handle(self, k):
+        self.message = None
+        v = self.view()
+        if k == ord('Q'):
+            return False
+        if k in (ord('q'), 27):
+            if self.stack:
+                self.stack.pop()
+                self.view().next = 0
+                return True
+            return k == 27  # Esc at a tab does nothing; q quits
+        if k == ord('?'):
+            self.stack.append(HelpView(self.host))
+            return True
+        if k == ord('r'):
+            self.host.poke()
+            v.next = 0
+            for t in self.tabs:
+                t.next = 0
+            return True
+        if k == ord('/'):
+            term = self.prompt('search: ')
+            if term:
+                v.search(term)
+            return True
+        if ord('1') <= k <= ord('5'):
+            self.stack, self.tab = [], k - ord('1')
+            self.tabs[self.tab].next = 0
+            return True
+        if k in (9, curses.KEY_BTAB):
+            self.stack = []
+            self.tab = (self.tab + (1 if k == 9 else -1)) % len(self.tabs)
+            self.tabs[self.tab].next = 0
+            return True
+        res = v.key(k)
+        if isinstance(res, tuple) and res[0] == 'push':
+            self.stack.append(res[1])
+        elif res is False and k in BACK and self.stack:
+            self.stack.pop()
+        return True
+
+    def loop(self):
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+        self.scr.timeout(500)
+        self.scr.keypad(True)
+        while True:
+            for t in [self.view()]:
+                try:
+                    t.tick()
+                except Exception as e:  # a view must not take the dashboard down; say what broke
+                    self.message = f' {t.title}: {e!r}'
+            self.draw()
+            k = self.scr.getch()
+            if k == -1:
+                continue
+            if k == curses.KEY_RESIZE:
+                continue
+            if self.handle(k) is False:
+                return
+
+
+def main_curses(scr):
+    init_styles()
+    host = Host()
+    host.start()
+    App(scr, host).loop()
+
+
+# ---- --dump -------------------------------------------------------------------------------------------------------
+
+def dump(args):
+    host = Host()
+    host.refresh()
+    what = args[0] if args else 'overview'
+    verbose = '--verbose' in args
+    out = []
+    if what == 'overview':
+        out = overview_lines(host)
+    elif what == 'sessions':
+        v = SessionsView(host)
+        v.closed = '--closed' in args
+        v.refresh()
+        out = [L(' | '.join(c[0] for c in cells_)) for _, cells_, _ in v.table.rows]
+    elif what == 'tasks':
+        v = TasksView(host)
+        v.all = '--all' in args
+        v.refresh()
+        out = [L(' | '.join(c[0] for c in cells_)) for _, cells_, _ in v.table.rows]
+    elif what == 'logs':
+        v = LogsView(host)
+        v.refresh()
+        out = v.pager.lines[-50:]
+    elif what == 'files':
+        v = FilesView(host, args[1] if len(args) > 1 and not args[1].startswith('-') else GROUPS_DIR)
+        v.refresh()
+        out = v.header() + [L(' | '.join(c[0] for c in cells_)) for _, cells_, _ in v.table.rows]
+    elif what == 'file':
+        out = file_lines(args[1])
+    elif what == 'paths':
+        out = [L(f'{k:15} {v}') for k, v in (('root', ROOT), ('slug', SLUG), ('systemd unit', SYSTEMD_UNIT),
+                                             ('launchd label', LAUNCHD_LABEL), ('ncl', NCL), ('runtime', RUNTIME))]
+        out += [L(f'container       {sid} {container_name(sid)}') for sid in args[1:]]
+        out += [L(f'ncl call        {" ".join([resource, "list", *extra, "--json"])}')
+                for resource, extra in {**Host.FAST, **Host.SLOW}.items()]
+    elif what == 'session':
+        s = [x for x in host.sessions() if x['id'] == args[1]]
+        if not s:
+            sys.exit(f'nctop: no session {args[1]}')
+        v = SessionView(host, s[0], mode='messages' if '--messages' in args else None)
+        v.verbose = verbose
+        v.refresh()
+        out = v.header() + v.pager.lines[-200:]
+    else:
+        sys.exit(f'nctop: unknown view {what!r}')
+    for segs, _ in out:
+        print(plain(segs))
+
+
+def main():
+    if sys.platform.startswith('linux') and os.path.isdir(f'/run/user/{os.getuid()}'):
+        os.environ.setdefault('XDG_RUNTIME_DIR', f'/run/user/{os.getuid()}')  # systemctl --user under sudo -u
+    owner_hint()
+    args = sys.argv[1:]
+    if args and args[0] in ('-h', '--help'):
+        with open(__file__) as f:
+            for ln in f.read().split('\n')[1:]:
+                if not ln.startswith('#'):
+                    break
+                print(ln[2:])
+        return
+    if args and args[0] == '--dump':
+        dump(args[1:])
+        return
+    os.environ.setdefault('ESCDELAY', '25')
+    curses.wrapper(main_curses)
+
+
+if __name__ == '__main__':
+    main()

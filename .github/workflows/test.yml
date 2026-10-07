@@ -1,0 +1,50 @@
+name: Test against upstream NanoClaw
+
+# Applies the skill to a fresh clone of upstream NanoClaw main and runs its tests,
+# on every push and weekly, so a change in core that breaks nctop shows up here.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 6 * * 1"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: skill
+      - uses: actions/checkout@v4
+        with:
+          repository: nanocoai/nanoclaw
+          path: nanoclaw
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: nanoclaw/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install NanoClaw dependencies
+        working-directory: nanoclaw
+        run: pnpm install --frozen-lockfile
+      - name: Apply the skill
+        working-directory: nanoclaw
+        run: |
+          mkdir -p tools/nctop
+          cp ../skill/add/tools/nctop/nctop ../skill/add/tools/nctop/test_nctop.py tools/nctop/
+          cp ../skill/add/src/nctop.test.ts src/
+          chmod +x tools/nctop/nctop
+      - name: Format check
+        working-directory: nanoclaw
+        run: pnpm exec prettier --check src/nctop.test.ts
+      - name: Core-integration test
+        working-directory: nanoclaw
+        run: pnpm exec vitest run src/nctop.test.ts
+      - name: nctop tests
+        working-directory: nanoclaw
+        run: python3 tools/nctop/test_nctop.py
